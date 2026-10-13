@@ -570,7 +570,14 @@ impl<W> Writer<'_, W> {
                         // float textureLod(samplerCubeArrayShadow sampler, vec4 P, float compare, float lod)
                         ext_used |= (cube || array2d) && lod && !prefer_grad_workaround;
 
-                        if ext_used {
+                        // r600 (pre-GCN AMD, Mesa) advertises/accepts no
+                        // GL_EXT_texture_shadow_lod usage in shaders, so
+                        // requesting it makes every shadow-sampling pipeline
+                        // fail to compile. Desktop GL 4.3+ covers the
+                        // constructs naga emits without the extension, and the
+                        // writer's textureGrad workaround handles lod-zero
+                        // samples on 2D-arrayed shadows, so skip the request.
+                        if false && ext_used {
                             features.request(Features::TEXTURE_SHADOW_LOD);
                         }
                     }
