@@ -574,7 +574,6 @@ impl super::Device {
                     };
                     unsafe { gl.program_binary(program, &binary) };
                     if unsafe { gl.get_program_link_status(program) } {
-                        log::info!("\tProgram {program:?} loaded from binary cache");
                         loaded_from_cache = true;
                     } else {
                         log::warn!(
@@ -591,7 +590,15 @@ impl super::Device {
         let loaded_from_cache = false;
 
         let mut shaders_to_delete = ArrayVec::<_, { crate::MAX_CONCURRENT_SHADER_STAGES }>::new();
+        #[cfg(not(target_arch = "wasm32"))]
+        let compile_started = std::time::Instant::now();
         if !loaded_from_cache {
+            log::info!(
+                "gles: compiling program {:?} ({} stages, {} bytes of GLSL)",
+                label.unwrap_or("?"),
+                sources.len(),
+                sources.iter().map(|(_, s, _, _)| s.len()).sum::<usize>(),
+            );
             if private_caps.contains(PrivateCapabilities::PROGRAM_BINARY) {
                 // Ask the driver to keep the program retrievable so it can be
                 // persisted after linking.
@@ -610,6 +617,18 @@ impl super::Device {
             for shader in shaders_to_delete {
                 unsafe { gl.delete_shader(shader) };
             }
+            #[cfg(not(target_arch = "wasm32"))]
+            log::info!(
+                "gles: program {:?} compiled in {:.1}s",
+                label.unwrap_or("?"),
+                compile_started.elapsed().as_secs_f32(),
+            );
+        } else {
+            log::info!(
+                "gles: program {:?} loaded from binary cache in {:.1}s",
+                label.unwrap_or("?"),
+                compile_started.elapsed().as_secs_f32(),
+            );
         }
 
         log::debug!("\tLinked program {program:?}");
