@@ -473,6 +473,25 @@ impl super::Device {
             super::binary_cache::hash_parts(&[&buf])
         };
 
+        // Diagnostics for slow drivers: name the program being compiled and
+        // how long the driver takes. Some GLES compilers stall for minutes
+        // on specific shaders.
+        #[cfg(not(target_arch = "wasm32"))]
+        let program_tag = format!(
+            "program '{}' key={:016x} {}",
+            label.unwrap_or("?"),
+            disk_key,
+            sources
+                .iter()
+                .map(|(stage, src, _, _)| format!("{}:{}B", map_naga_stage(*stage).bits(), src.len()))
+                .collect::<Vec<_>>()
+                .join("+"),
+        );
+        #[cfg(not(target_arch = "wasm32"))]
+        let compile_start = std::time::Instant::now();
+        #[cfg(not(target_arch = "wasm32"))]
+        log::info!("gles: compiling {}", program_tag);
+
         // Try to load the previously compiled program from the disk cache.
         // A stale entry (driver update changed the binary format) is
         // rejected by the driver and falls through to a normal compile.
@@ -619,6 +638,13 @@ impl super::Device {
 
         // Persist the freshly compiled program. Saved after the binding
         // remap so the remapped state is baked into the binary.
+        #[cfg(not(target_arch = "wasm32"))]
+        log::info!(
+            "gles: {} {} in {:.2}s",
+            if loaded_from_cache { "loaded" } else { "compiled" },
+            program_tag,
+            compile_start.elapsed().as_secs_f32()
+        );
         #[cfg(not(target_arch = "wasm32"))]
         if !loaded_from_cache {
             if let Some(disk) = disk_cache {
