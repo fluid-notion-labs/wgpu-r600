@@ -648,6 +648,14 @@ impl super::Adapter {
             super::PrivateCapabilities::INVALIDATE_FRAMEBUFFER,
             supported((3, 0), (4, 3)),
         );
+        // glGetProgramBinary/glProgramBinary are core in GL ES 3.0 and
+        // desktop GL 4.1, or via the OES/ARB get_program_binary extensions.
+        private_caps.set(
+            super::PrivateCapabilities::PROGRAM_BINARY,
+            supported((3, 0), (4, 1))
+                || extensions.contains("GL_OES_get_program_binary")
+                || extensions.contains("GL_ARB_get_program_binary"),
+        );
         if let Some(full_ver) = full_ver {
             let supported =
                 full_ver >= (4, 2) && extensions.contains("GL_ARB_shader_draw_parameters");
@@ -889,6 +897,8 @@ impl super::Adapter {
                     shading_language_version,
                     next_shader_id: Default::default(),
                     program_cache: Default::default(),
+                    #[cfg(not(target_arch = "wasm32"))]
+                    program_binary_cache: super::binary_cache::ProgramBinaryDiskCache::open(),
                     es: es_ver.is_some(),
                     max_msaa_samples: max_samples,
                 }),

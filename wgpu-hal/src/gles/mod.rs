@@ -90,6 +90,8 @@ mod web;
 mod wgl;
 
 mod adapter;
+#[cfg(not(target_arch = "wasm32"))]
+mod binary_cache;
 mod command;
 mod conv;
 mod device;
@@ -234,6 +236,8 @@ bitflags::bitflags! {
         const FULLY_FEATURED_INSTANCING = 1 << 16;
         /// Supports direct multisampled rendering to a texture without needing a resolve texture.
         const MULTISAMPLED_RENDER_TO_TEXTURE = 1 << 17;
+        /// Supports `glGetProgramBinary`/`glProgramBinary` (GL ES 3.0 / GL 4.1 core).
+        const PROGRAM_BINARY = 1 << 18;
     }
 }
 
@@ -280,6 +284,10 @@ struct AdapterShared {
     shading_language_version: naga::back::glsl::Version,
     next_shader_id: AtomicU32,
     program_cache: Mutex<ProgramCache>,
+    /// Disk-backed program binary cache, when a cache location is available
+    /// (see `binary_cache`). Persists compiled programs between runs.
+    #[cfg(not(target_arch = "wasm32"))]
+    program_binary_cache: Option<binary_cache::ProgramBinaryDiskCache>,
     es: bool,
 
     /// Result of `gl.get_parameter_i32(glow::MAX_SAMPLES)`.
