@@ -289,13 +289,16 @@ impl super::Device {
         }
     }
 
-    fn create_shader(
+    /// Translates a naga stage to its final GLSL source without touching the
+    /// driver. The source feeds both the shader compilation and the content
+    /// key of the disk program-binary cache.
+    fn translate_shader(
         gl: &glow::Context,
         naga_stage: naga::ShaderStage,
         stage: &crate::ProgrammableStage<super::ShaderModule>,
         context: CompilationContext,
         program: glow::Program,
-    ) -> Result<glow::Shader, crate::PipelineError> {
+    ) -> Result<String, crate::PipelineError> {
         let source = 'outer: {
             use naga::back::glsl;
             let pipeline_options = glsl::PipelineOptions {
@@ -309,6 +312,9 @@ impl super::Device {
             let naga = match stage.module.source {
                 super::ShaderModuleSource::Naga(ref naga) => naga,
                 super::ShaderModuleSource::Passthrough { ref source } => {
+                    // Raw GLSL module: no naga translation, so there is no
+                    // reflection to consume; the raw source is the compile
+                    // input and the disk-cache content key.
                     break 'outer Cow::Borrowed(source);
                 }
             };
@@ -392,7 +398,7 @@ impl super::Device {
             Cow::Owned(output)
         };
 
-        unsafe { Self::compile_shader(gl, &source, naga_stage, stage.module.label.as_deref()) }
+        Ok(source.into_owned())
     }
 
     unsafe fn create_pipeline<'a>(
@@ -418,6 +424,8 @@ impl super::Device {
                 constant_hash: Self::create_constant_hash(stage),
             });
         }
+        #[cfg(not(target_arch = "wasm32"))]
+        let disk_cache = self.shared.program_binary_cache.as_ref();
         let mut guard = self
             .shared
             .program_cache
@@ -439,6 +447,8 @@ impl super::Device {
                     multiview_mask,
                     self.shared.shading_language_version,
                     self.shared.private_caps,
+                    #[cfg(not(target_arch = "wasm32"))]
+                    disk_cache,
                 )
             })
             .to_owned()?;
@@ -458,6 +468,7 @@ impl super::Device {
         buf
     }
 
+    #[allow(clippy::too_many_arguments)]
     unsafe fn create_program<'a>(
         gl: &glow::Context,
         shaders: ArrayVec<ShaderStage<'a>, { crate::MAX_CONCURRENT_SHADER_STAGES }>,
@@ -466,6 +477,8 @@ impl super::Device {
         multiview_mask: Option<NonZeroU32>,
         glsl_version: naga::back::glsl::Version,
         private_caps: PrivateCapabilities,
+        #[cfg(not(target_arch = "wasm32"))]
+        disk_cache: Option<&super::binary_cache::ProgramBinaryDiskCache>,
     ) -> Result<Arc<super::PipelineInner>, crate::PipelineError> {
         let glsl_version = match glsl_version {
             naga::back::glsl::Version::Embedded { version, .. } => format!("{version} es"),
@@ -484,9 +497,15 @@ impl super::Device {
         let mut immediates_items = ArrayVec::<_, { crate::MAX_CONCURRENT_SHADER_STAGES }>::new();
         let mut sampler_map = [None; super::MAX_TEXTURE_SLOTS];
         let mut has_stages = wgt::ShaderStages::empty();
-        let mut shaders_to_delete = ArrayVec::<_, { crate::MAX_CONCURRENT_SHADER_STAGES }>::new();
         let mut clip_distance_count = 0;
 
+        // Translate every stage to its final GLSL first: the sources
+        // determine the program-binary cache key, and only the compile/link
+        // step is skippable on a cache hit.
+        let mut sources: ArrayVec<
+            (naga::ShaderStage, String, &'a str, Option<&'a str>),
+            { crate::MAX_CONCURRENT_SHADER_STAGES },
+        > = ArrayVec::new();
         for &(naga_stage, stage) in &shaders {
             has_stages |= map_naga_stage(naga_stage);
             let pc_item = {
@@ -502,32 +521,95 @@ impl super::Device {
                 clip_distance_count: &mut clip_distance_count,
             };
 
-            let shader = Self::create_shader(gl, naga_stage, stage, context, program)?;
-            shaders_to_delete.push(shader);
+            let src = Self::translate_shader(gl, naga_stage, stage, context, program)?;
+            sources.push((
+                naga_stage,
+                src,
+                stage.entry_point,
+                stage.module.label.as_deref(),
+            ));
         }
 
         // Create empty fragment shader if only vertex shader is present
         if has_stages == wgt::ShaderStages::VERTEX {
-            let shader_src = format!("#version {glsl_version}\n void main(void) {{}}",);
             log::debug!("Only vertex shader is present. Creating an empty fragment shader",);
-            let shader = unsafe {
-                Self::compile_shader(
-                    gl,
-                    &shader_src,
-                    naga::ShaderStage::Fragment,
-                    Some("(wgpu internal) dummy fragment shader"),
-                )
-            }?;
-            shaders_to_delete.push(shader);
+            let shader_src = format!("#version {glsl_version}\n void main(void) {{}}",);
+            sources.push((naga::ShaderStage::Fragment, shader_src, "", None));
         }
 
-        for &shader in shaders_to_delete.iter() {
-            unsafe { gl.attach_shader(program, shader) };
-        }
-        unsafe { gl.link_program(program) };
+        // Content key for the disk program-binary cache: everything that
+        // changes what the driver compiles (sources, entry points, GLSL
+        // version, multiview). The pipeline layout is applied as program
+        // state after creation, so it is deliberately not part of the key.
+        #[cfg(not(target_arch = "wasm32"))]
+        let disk_key = {
+            let mut buf: Vec<u8> = Vec::new();
+            buf.extend_from_slice(glsl_version.as_bytes());
+            buf.push(multiview_mask.is_some() as u8);
+            if let Some(mask) = multiview_mask {
+                buf.extend_from_slice(&mask.get().to_le_bytes());
+            }
+            for &(stage, ref src, entry, _) in &sources {
+                buf.push(map_naga_stage(stage).bits() as u8);
+                buf.extend_from_slice(entry.as_bytes());
+                buf.push(0);
+                buf.extend_from_slice(&(src.len() as u32).to_le_bytes());
+                buf.extend_from_slice(src.as_bytes());
+            }
+            super::binary_cache::hash_parts(&[&buf])
+        };
 
-        for shader in shaders_to_delete {
-            unsafe { gl.delete_shader(shader) };
+        // Try to load the previously compiled program from the disk cache.
+        // A stale entry (driver update changed the binary format) is
+        // rejected by the driver and falls through to a normal compile.
+        #[cfg(not(target_arch = "wasm32"))]
+        let mut loaded_from_cache = false;
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(disk) = disk_cache {
+            if private_caps.contains(PrivateCapabilities::PROGRAM_BINARY) {
+                if let Some(stored) = disk.get(disk_key) {
+                    let binary = glow::ProgramBinary {
+                        format: stored.format,
+                        buffer: stored.data,
+                    };
+                    unsafe { gl.program_binary(program, &binary) };
+                    if unsafe { gl.get_program_link_status(program) } {
+                        log::info!("\tProgram {program:?} loaded from binary cache");
+                        loaded_from_cache = true;
+                    } else {
+                        log::warn!(
+                            "\tCached program binary rejected by the driver; recompiling"
+                        );
+                        let msg = unsafe { gl.get_program_info_log(program) };
+                        log::debug!("\tBinary load message: {msg}");
+                        disk.invalidate(disk_key);
+                    }
+                }
+            }
+        }
+        #[cfg(target_arch = "wasm32")]
+        let loaded_from_cache = false;
+
+        let mut shaders_to_delete = ArrayVec::<_, { crate::MAX_CONCURRENT_SHADER_STAGES }>::new();
+        if !loaded_from_cache {
+            if private_caps.contains(PrivateCapabilities::PROGRAM_BINARY) {
+                // Ask the driver to keep the program retrievable so it can be
+                // persisted after linking.
+                unsafe { gl.program_binary_retrievable_hint(program, true) };
+            }
+            for &(stage, ref src, _, label) in &sources {
+                let shader = unsafe { Self::compile_shader(gl, src, stage, label)? };
+                shaders_to_delete.push(shader);
+            }
+
+            for &shader in shaders_to_delete.iter() {
+                unsafe { gl.attach_shader(program, shader) };
+            }
+            unsafe { gl.link_program(program) };
+
+            for shader in shaders_to_delete {
+                unsafe { gl.delete_shader(shader) };
+            }
         }
 
         log::debug!("\tLinked program {program:?}");
@@ -598,6 +680,23 @@ impl super::Device {
         } else {
             None
         };
+
+        // Persist the freshly compiled program. Saved after the binding
+        // remap so the remapped state is baked into the binary.
+        #[cfg(not(target_arch = "wasm32"))]
+        if !loaded_from_cache {
+            if let Some(disk) = disk_cache {
+                if private_caps.contains(PrivateCapabilities::PROGRAM_BINARY) {
+                    if let Some(binary) = unsafe { gl.get_program_binary(program) } {
+                        disk.store(disk_key, binary.format, &binary.buffer);
+                        log::debug!(
+                            "\tStored program binary ({:.0} KiB)",
+                            binary.buffer.len() as f32 / 1024.0
+                        );
+                    }
+                }
+            }
+        }
 
         Ok(Arc::new(super::PipelineInner {
             program,

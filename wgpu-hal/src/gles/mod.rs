@@ -90,6 +90,8 @@ mod web;
 mod wgl;
 
 mod adapter;
+#[cfg(not(target_arch = "wasm32"))]
+mod binary_cache;
 mod command;
 mod conv;
 mod device;
@@ -249,6 +251,8 @@ bitflags::bitflags! {
         /// `GL_ARB_shader_image_load_store`; GLES needs `GL_NV_image_formats`
         /// (which itself depends on `GL_EXT_texture_norm16`).
         const TEXTURE_FORMAT_NORM16_STORAGE = 1 << 20;
+        /// Supports `glGetProgramBinary`/`glProgramBinary` (GL ES 3.0 / GL 4.1 core).
+        const PROGRAM_BINARY = 1 << 21;
     }
 }
 
@@ -295,6 +299,10 @@ struct AdapterShared {
     shading_language_version: naga::back::glsl::Version,
     next_shader_id: AtomicU32,
     program_cache: Mutex<ProgramCache>,
+    /// Disk-backed program binary cache, when a cache location is available
+    /// (see `binary_cache`). Persists compiled programs between runs.
+    #[cfg(not(target_arch = "wasm32"))]
+    program_binary_cache: Option<binary_cache::ProgramBinaryDiskCache>,
     es: bool,
 
     /// Result of `gl.get_parameter_i32(glow::MAX_SAMPLES)`.
