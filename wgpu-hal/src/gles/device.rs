@@ -495,10 +495,21 @@ impl super::Device {
         // Try to load the previously compiled program from the disk cache.
         // A stale entry (driver update changed the binary format) is
         // rejected by the driver and falls through to a normal compile.
+        //
+        // Some drivers (PowerVR) reject compute program binaries on load
+        // ("unpack program binary error") while graphics binaries load
+        // fine — and compute shaders recompile in milliseconds anyway, so
+        // the disk cache is only used for programs with graphics stages.
+        #[cfg(not(target_arch = "wasm32"))]
+        let cacheable = disk_cache.filter(|_| {
+            sources
+                .iter()
+                .all(|(stage, ..)| *stage != naga::ShaderStage::Compute)
+        });
         #[cfg(not(target_arch = "wasm32"))]
         let mut loaded_from_cache = false;
         #[cfg(not(target_arch = "wasm32"))]
-        if let Some(disk) = disk_cache {
+        if let Some(disk) = cacheable {
             if private_caps.contains(PrivateCapabilities::PROGRAM_BINARY) {
                 if let Some(stored) = disk.get(disk_key) {
                     let binary = glow::ProgramBinary {
@@ -647,7 +658,7 @@ impl super::Device {
         );
         #[cfg(not(target_arch = "wasm32"))]
         if !loaded_from_cache {
-            if let Some(disk) = disk_cache {
+            if let Some(disk) = cacheable {
                 if private_caps.contains(PrivateCapabilities::PROGRAM_BINARY) {
                     if let Some(binary) = unsafe { gl.get_program_binary(program) } {
                         disk.store(disk_key, binary.format, &binary.buffer);
