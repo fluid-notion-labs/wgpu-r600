@@ -323,6 +323,7 @@ impl fmt::Debug for AdapterShared {
             shading_language_version,
             next_shader_id,
             program_cache: _,
+            program_binary_cache: _,
             es,
             max_msaa_samples,
         } = self;
